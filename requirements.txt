@@ -1,9 +1,13 @@
-trl
+torch 
 transformers 
 accelerate 
-git+https://github.com/huggingface/peft.git
 datasets 
 bitsandbytes 
-einops 
-wandb
-huggingface_hub
+huggingface_hub 
+peft 
+trl 
+pandas 
+datasets  
+ninja 
+packaging 
+flash-attn --no-build-isolation
