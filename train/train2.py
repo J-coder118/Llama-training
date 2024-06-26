@@ -1,4 +1,3 @@
-import os
 import torch, platform
 from datasets import load_dataset, Dataset
 from transformers import (
@@ -11,10 +10,16 @@ from transformers import (
     logging,
 )
 from peft import LoraConfig, PeftModel
-from utils import print_system_specs, random_split, create_prompt
 from trl import SFTTrainer
 import pandas as pd
-     
+from huggingface_hub import notebook_login
+
+notebook_login()
+
+def create_prompt(row):
+    # video check
+    prompt = f" Context: {row[4]}\nInstruction: {row[3]}\nResponse: {row[5]}"
+    return prompt
 
 # The model that you want to train from the Hugging Face hub
 model_name = "NousResearch/Llama-2-7b-chat-hf"
@@ -22,17 +27,15 @@ model_name = "NousResearch/Llama-2-7b-chat-hf"
 # The instruction dataset to use
 dataset = []
 # Load the CSV file into a Pandas DataFrame
-df = pd.read_csv('ai_logs_for_website_scraper_6-16-24.csv', header=None)
+# df = pd.read_csv('ai_logs.csv')
+dataset = load_dataset("csv", data_files="ai_logs.csv")
 
+columns_to_keep = ['instruction', 'prompt', 'response']
+
+# Remove the unnecessary columns
+dataset = dataset.remove_columns([col for col in dataset['train'].features if col not in columns_to_keep])
 # Fine-tuned model name
 new_model = "llama-2-7b-finetuned"
-
-
-################################################################################
-# Check device
-################################################################################
-
-print_system_specs()
 
 ################################################################################
 # QLoRA parameters
@@ -71,7 +74,7 @@ use_nested_quant = False
 output_dir = "./results"
 
 # Number of training epochs
-num_train_epochs = 10
+num_train_epochs = 1
 
 # Enable fp16/bf16 training (set bf16 to True with an A100)
 fp16 = False
@@ -102,13 +105,13 @@ weight_decay = 0.001
 optim = "paged_adamw_32bit"
 
 # Learning rate schedule
-lr_scheduler_type = "cosine"
+lr_scheduler_type = "cosine"#"constant"
 
 # Number of training steps (overrides num_train_epochs)
 max_steps = -1
 
 # Ratio of steps for a linear warmup (from 0 to learning rate)
-warmup_ratio = 0.03
+warmup_ratio = 0.0011
 
 # Group sequences into batches with same length
 # Saves memory and speeds up training considerably
@@ -125,24 +128,24 @@ logging_steps = 25
 ################################################################################
 
 # Maximum sequence length to use
-max_seq_length = 3000
+max_seq_length = 2048
+
 
 # Pack multiple short examples in the same input sequence to increase efficiency
 packing = False
 
 # Load the entire model on the GPU 0
 device_map = {"": 0}
-     
-
-# Load dataset (you can process it here)
-# dataset = load_dataset(dataset_name, split="train")
 
 
-train_df, validation_df, test_df = random_split(df, 0.7, 0.1)
-train_df['text'] = train_df.apply(create_prompt, axis=1)
-data_df = train_df
+# train_df = train_df.drop(["id","date_added","engine","temperature","input_tokens","output_tokens","cost","identifier","time"], axis=1)
+# dataset = train_df.map(lambda example: {'text': example['prompt'] + example['response']})
+dataset = dataset.map(lambda example: {'text': str(example['prompt']) + str(example['response'])})
+print("==================database===================", dataset)
+# train_df['text'] = train_df.apply(create_prompt, axis=1)
+# data_df = train_df
 
-dataset = Dataset.from_pandas(data_df)
+# dataset = Dataset.from_pandas(data_df)
 # Load tokenizer and model with QLoRA configuration
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -152,7 +155,6 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=compute_dtype,
     bnb_4bit_use_double_quant=use_nested_quant,
 )
-
 # Check GPU compatibility with bfloat16
 if compute_dtype == torch.float16 and use_4bit:
     major, _ = torch.cuda.get_device_capability()
@@ -208,7 +210,7 @@ training_arguments = TrainingArguments(
 # Set supervised fine-tuning parameters
 trainer = SFTTrainer(
     model=model,
-    train_dataset=dataset,
+    train_dataset=dataset['train'],
     peft_config=peft_config,
     dataset_text_field="text",
     max_seq_length=max_seq_length,
@@ -216,14 +218,10 @@ trainer = SFTTrainer(
     args=training_arguments,
     packing=packing,
 )
-
 # Train model
 trainer.train()
-
 # Save trained model
 trainer.model.save_pretrained(new_model)
-
-
 
 # Reload model in FP16 and merge it with LoRA weights
 base_model = AutoModelForCausalLM.from_pretrained(
@@ -240,8 +238,6 @@ model = model.merge_and_unload()
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
-
-
 
 model.push_to_hub(new_model, use_temp_dir=False)
 tokenizer.push_to_hub(new_model, use_temp_dir=False)

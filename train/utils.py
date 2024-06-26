@@ -38,5 +38,5 @@ def random_split(df, train_frac, validation_frac):
 
 def create_prompt(row):
     # video check
-    prompt = f"Instruction: {row['instruction']}\nContext: {row['prompt']}\nResponse: {row['response']}"
+    prompt = f" Context: {row['prompt']}\nInstruction: {row['instruction']}\nResponse: {row['response']}"
     return prompt

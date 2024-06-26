@@ -1,150 +1,236 @@
-from huggingface_hub import login
-login()
-
-import torch
+import torch, platform
 from datasets import load_dataset, Dataset
-import peft import LoraConfig, AutoPeftModelForCausalLM, prepare_model_for_kbit_training, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig, TrainingArguments, BitsAndBytesConfig, GenerationConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    HfArgumentParser,
+    TrainingArguments,
+    pipeline,
+    logging,
+)
+from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
-import os, wandb, platform, gradio, warnings
 import pandas as pd
-import json
-import tqdm
-
-dataset = []
-# Load the CSV file into a Pandas DataFrame
-df = pd.read_csv('ai_logs_for_website_scraper_6-16-24.csv', header=None)
-print(df.head())
-
-
-def print_system_specs():
-    # Check if CUDA is available
-    is_cuda_available = torch.cuda.is_available()
-    print("CUDA Available:", is_cuda_available)
-# Get the number of available CUDA devices
-    num_cuda_devices = torch.cuda.device_count()
-    print("Number of CUDA devices:", num_cuda_devices)
-    if is_cuda_available:
-        for i in range(num_cuda_devices):
-            # Get CUDA device properties
-            device = torch.device('cuda', i)
-            print(f"--- CUDA Device {i} ---")
-            print("Name:", torch.cuda.get_device_name(i))
-            print("Compute Capability:", torch.cuda.get_device_capability(i))
-            print("Total Memory:", torch.cuda.get_device_properties(i).total_memory, "bytes")
-    # Get CPU information
-    print("--- CPU Information ---")
-    print("Processor:", platform.processor())
-    print("System:", platform.system(), platform.release())
-    print("Python Version:", platform.python_version())
-print_system_specs()
-
-
-# data split
-def random_split(df, train_frac, validation_frac):
-    # Shuffle the entire DataFrame
-    df = df.sample(frac=1, random_state=123).reset_index(drop=True)
-
-    # Calculate split indices
-    train_end = int(len(df) * train_frac)
-    validation_end = train_end + int(len(df) * validation_frac)
-
-    # Split the DataFrame
-    train_df = df[:train_end]
-    validation_df = df[train_end:validation_end]
-    test_df = df[validation_end:]
-
-    return train_df, validation_df, test_df
-
-# come from book
-train_df, validation_df, test_df = random_split(df, 0.7, 0.1)
-
-train_df.to_csv("train.csv", index=None)
-validation_df.to_csv("validation.csv", index=None)
-test_df.to_csv("test.csv", index=None)
 
 def create_prompt(row):
     # video check
-    prompt = f"Instruction: {row['instruction']}\nContext: {row['prompt']}\nResponse: {row['response']}"
+    prompt = f" Context: {row[4]}\nInstruction: {row[3]}\nResponse: {row[5]}"
     return prompt
+
+# The model that you want to train from the Hugging Face hub
+model_name = "NousResearch/Llama-2-7b-chat-hf"
+
+# The instruction dataset to use
+dataset = []
+# Load the CSV file into a Pandas DataFrame
+df = pd.read_csv('ai_logs.csv', header=None)
+
+# Fine-tuned model name
+new_model = "llama-2-7b-finetuned"
+
+################################################################################
+# QLoRA parameters
+################################################################################
+
+# LoRA attention dimension
+lora_r = 64
+
+# Alpha parameter for LoRA scaling
+lora_alpha = 16
+
+# Dropout probability for LoRA layers
+lora_dropout = 0.1
+
+################################################################################
+# bitsandbytes parameters
+################################################################################
+
+# Activate 4-bit precision base model loading
+use_4bit = True
+
+# Compute dtype for 4-bit base models
+bnb_4bit_compute_dtype = "float16"
+
+# Quantization type (fp4 or nf4)
+bnb_4bit_quant_type = "nf4"
+
+# Activate nested quantization for 4-bit base models (double quantization)
+use_nested_quant = False
+
+################################################################################
+# TrainingArguments parameters
+################################################################################
+
+# Output directory where the model predictions and checkpoints will be stored
+output_dir = "./results"
+
+# Number of training epochs
+num_train_epochs = 1
+
+# Enable fp16/bf16 training (set bf16 to True with an A100)
+fp16 = False
+bf16 = False
+
+# Batch size per GPU for training
+per_device_train_batch_size = 4
+
+# Batch size per GPU for evaluation
+per_device_eval_batch_size = 4
+
+# Number of update steps to accumulate the gradients for
+gradient_accumulation_steps = 1
+
+# Enable gradient checkpointing
+gradient_checkpointing = True
+
+# Maximum gradient normal (gradient clipping)
+max_grad_norm = 0.3
+
+# Initial learning rate (AdamW optimizer)
+learning_rate = 2e-4
+
+# Weight decay to apply to all layers except bias/LayerNorm weights
+weight_decay = 0.001
+
+# Optimizer to use
+optim = "paged_adamw_32bit"
+
+# Learning rate schedule
+lr_scheduler_type = "cosine"#"constant"
+
+# Number of training steps (overrides num_train_epochs)
+max_steps = -1
+
+# Ratio of steps for a linear warmup (from 0 to learning rate)
+warmup_ratio = 0.0011
+
+# Group sequences into batches with same length
+# Saves memory and speeds up training considerably
+group_by_length = True
+
+# Save checkpoint every X updates steps
+save_steps = 0
+
+# Log every X updates steps
+logging_steps = 25
+
+################################################################################
+# SFT parameters
+################################################################################
+
+# Maximum sequence length to use
+max_seq_length = 250
+
+# Pack multiple short examples in the same input sequence to increase efficiency
+packing = False
+
+# Load the entire model on the GPU 0
+device_map = {"": 0}
+
+train_df = df
 
 train_df['text'] = train_df.apply(create_prompt, axis=1)
 data_df = train_df
 
-data = Dataset.from_pandas(data_df)
+dataset = Dataset.from_pandas(data_df)
+# Load tokenizer and model with QLoRA configuration
+compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
-data = Dataset.from_pandas(data_df)
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=use_4bit,
+    bnb_4bit_quant_type=bnb_4bit_quant_type,
+    bnb_4bit_compute_dtype=compute_dtype,
+    bnb_4bit_use_double_quant=use_nested_quant,
+)
+# Check GPU compatibility with bfloat16
+if compute_dtype == torch.float16 and use_4bit:
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 8:
+        print("=" * 80)
+        print("Your GPU supports bfloat16: accelerate training with bf16=True")
+        print("=" * 80)
 
-model_id="llama-2-13b-chat-hf-weights-local-path"
+# Load base model
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map=device_map
+)
+model.config.use_cache = False
+model.config.pretraining_tp = 1
 
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Load LLaMA tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 
-
-# Configure quantization for memory efficiency
-quantization_config_loading = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=False
+# Load LoRA configuration
+peft_config = LoraConfig(
+    lora_alpha=lora_alpha,
+    lora_dropout=lora_dropout,
+    r=lora_r,
+    bias="none",
+    task_type="CAUSAL_LM",
 )
 
-# Load LLAMA2 13B model with quantization configurations
-model = AutoModelForCausalLM.from_pretrained(
-                                model_id,
-                                quantization_config=quantization_config_loading,
-                                device_map="auto"
-                            )
-
-# Modify model configuration parameters
-model.config.use_cache=False
-model.config.pretraining_tp=1
-model.gradient_checkpointing_enable()
-model = prepare_model_for_kbit_training(model)
-
-# Configure PEFT (Parameter Efficient Fine-Tuning)
-peft_config = LoraConfig(
-                    r=16,
-                    lora_alpha=16,
-                    lora_dropout=0.05,
-                    bias="none",
-                    task_type="CAUSAL_LM",
-                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]
-                )
-
-# Apply PEFT configurations to the model
-model = get_peft_model(model, peft_config)
-
-# Define training arguments
+# Set training parameters
 training_arguments = TrainingArguments(
-                            output_dir="LLaMa2_13B_Chat-finetuned-exp",
-                            per_device_train_batch_size=8,
-                            gradient_accumulation_steps=1,
-                            optim="paged_adamw_32bit",
-                            learning_rate=2e-4,
-                            lr_scheduler_type="cosine",
-                            save_strategy="epoch",
-                            logging_steps=50,
-                            num_train_epochs=1,
-                            max_steps=500,
-                            fp16=True,
-                            push_to_hub=True
-                        )
+    output_dir=output_dir,
+    num_train_epochs=num_train_epochs,
+    per_device_train_batch_size=per_device_train_batch_size,
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    optim=optim,
+    save_steps=save_steps,
+    logging_steps=logging_steps,
+    learning_rate=learning_rate,
+    weight_decay=weight_decay,
+    fp16=fp16,
+    bf16=bf16,
+    max_grad_norm=max_grad_norm,
+    max_steps=max_steps,
+    warmup_ratio=warmup_ratio,
+    group_by_length=group_by_length,
+    lr_scheduler_type=lr_scheduler_type,
+    report_to="tensorboard"
+)
 
-# Initialize SFTTrainer for training
+# Set supervised fine-tuning parameters
 trainer = SFTTrainer(
-            model=model,
-            train_dataset=data,
-            peft_config=peft_config,
-            dataset_text_field="text",
-            args=training_arguments,
-            tokenizer=tokenizer,
-            packing=False,
-            max_seq_length=512
-    )
-
-# Train the model
+    model=model,
+    train_dataset=dataset,
+    peft_config=peft_config,
+    dataset_text_field="text",
+    max_seq_length=max_seq_length,
+    tokenizer=tokenizer,
+    args=training_arguments,
+    packing=packing,
+)
+# Train model
 trainer.train()
+# Save trained model
+trainer.model.save_pretrained(new_model)
 
-# Push the trained model to Hugging Face Hub
-trainer.push_to_hub()
+
+
+# from huggingface_hub import notebook_login
+
+# notebook_login()
+# Reload model in FP16 and merge it with LoRA weights
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    low_cpu_mem_usage=True,
+    return_dict=True,
+    torch_dtype=torch.float16,
+    device_map=device_map,
+)
+model = PeftModel.from_pretrained(base_model, new_model)
+model = model.merge_and_unload()
+
+# Reload tokenizer to save it
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+model.push_to_hub(new_model, use_temp_dir=False)
+tokenizer.push_to_hub(new_model, use_temp_dir=False)
